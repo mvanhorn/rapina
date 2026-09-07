@@ -5,7 +5,7 @@
 //! 2. Resolve relationships and validate targets exist
 
 use proc_macro2::Span;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use syn::{Ident, Result};
 
 use super::parse::{EntityAttrs, EntityDef, FieldAttrs, FieldDef, RawFieldType, Schema};
@@ -35,6 +35,8 @@ pub struct AnalyzedField {
     pub ty: FieldType,
     #[allow(dead_code)]
     pub span: Span,
+
+    pub implement_related: bool,
 }
 
 /// Entity registry for cross-reference validation.
@@ -76,9 +78,111 @@ pub fn analyze_schema(schema: Schema) -> Result<AnalyzedSchema> {
         analyzed_entities.push(analyze_entity(entity, &registry)?);
     }
 
-    Ok(AnalyzedSchema {
+    let analyzed = AnalyzedSchema {
         entities: analyzed_entities,
-    })
+    };
+
+    validate_relationship_primary_keys(&analyzed)?;
+
+    Ok(analyzed)
+}
+
+fn validate_relationship_primary_keys(schema: &AnalyzedSchema) -> Result<()> {
+    for entity in &schema.entities {
+        let Some(pk_cols) = &entity.attrs.primary_key else {
+            continue;
+        };
+        if pk_cols.len() != 1 {
+            continue;
+        }
+
+        let Some(field) = entity.fields.iter().find(|field| field.name == pk_cols[0]) else {
+            continue;
+        };
+        let FieldType::BelongsTo { target, .. } = &field.ty else {
+            continue;
+        };
+
+        let mut visiting = HashSet::from([entity.name.to_string()]);
+        if primary_key_relationship_has_cycle(target, schema, &mut visiting) {
+            return Err(syn::Error::new(
+                field.name.span(),
+                format!(
+                    "schema relationship `{}.{}` forms a primary key cycle; primary-key belongs_to relationships must resolve to a scalar primary key column",
+                    entity.name, field.name
+                ),
+            ));
+        }
+    }
+
+    for entity in &schema.entities {
+        for field in &entity.fields {
+            let FieldType::BelongsTo { target, .. } = &field.ty else {
+                continue;
+            };
+
+            let Some(target_entity) = schema.entities.iter().find(|e| &e.name == target) else {
+                continue;
+            };
+            let Some(pk_cols) = &target_entity.attrs.primary_key else {
+                continue;
+            };
+
+            if pk_cols.len() > 1 {
+                let pk_list = pk_cols
+                    .iter()
+                    .map(|col| format!("`{}`", col))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                return Err(syn::Error::new(
+                    field.name.span(),
+                    format!(
+                        "schema relationship `{}.{}` targets `{}` with composite primary key ({}); belongs_to relationships currently require a target with a single primary key column",
+                        entity.name, field.name, target_entity.name, pk_list
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn primary_key_relationship_has_cycle(
+    target: &Ident,
+    schema: &AnalyzedSchema,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    let target_name = target.to_string();
+    if !visiting.insert(target_name.clone()) {
+        return true;
+    }
+
+    let has_cycle = schema
+        .entities
+        .iter()
+        .find(|entity| entity.name == target_name)
+        .and_then(|entity| {
+            let pk_cols = entity.attrs.primary_key.as_ref()?;
+            if pk_cols.len() != 1 {
+                return None;
+            }
+
+            let pk_field = entity
+                .fields
+                .iter()
+                .find(|field| field.name == pk_cols[0])?;
+            let FieldType::BelongsTo { target, .. } = &pk_field.ty else {
+                return None;
+            };
+
+            Some(primary_key_relationship_has_cycle(target, schema, visiting))
+        })
+        .unwrap_or(false);
+
+    visiting.remove(&target_name);
+    has_cycle
 }
 
 fn analyze_entity(entity: EntityDef, registry: &EntityRegistry) -> Result<AnalyzedEntity> {
@@ -105,6 +209,8 @@ fn analyze_entity(entity: EntityDef, registry: &EntityRegistry) -> Result<Analyz
         analyzed_fields.push(analyze_field(field, registry)?);
     }
 
+    pick_related_impl_fields(&entity.name, &mut analyzed_fields)?;
+
     // Validate custom primary key columns exist in the entity
     if let Some(ref pk_cols) = entity.attrs.primary_key {
         let field_names: HashSet<String> =
@@ -122,17 +228,36 @@ fn analyze_entity(entity: EntityDef, registry: &EntityRegistry) -> Result<Analyz
             }
         }
 
-        // Validate PK columns are scalar types (not relationships)
+        // Validate PK columns are database columns. A (required) belongs_to field
+        // is allowed because it generates a non-null FK column using the target
+        // entity's PK type. A has_many field has no column, and an optional
+        // belongs_to would produce a nullable column, neither of which can be a
+        // primary key.
         for field in &analyzed_fields {
             let fname = field.name.to_string();
-            if pk_cols.contains(&fname) && !matches!(field.ty, FieldType::Scalar { .. }) {
-                return Err(syn::Error::new(
-                    field.name.span(),
-                    format!(
-                        "primary_key column '{}' must be a scalar type, not a relationship",
-                        fname
-                    ),
-                ));
+            if !pk_cols.contains(&fname) {
+                continue;
+            }
+            match &field.ty {
+                FieldType::HasMany { .. } => {
+                    return Err(syn::Error::new(
+                        field.name.span(),
+                        format!(
+                            "primary_key column '{}' cannot be a has_many relationship",
+                            fname
+                        ),
+                    ));
+                }
+                FieldType::BelongsTo { optional: true, .. } => {
+                    return Err(syn::Error::new(
+                        field.name.span(),
+                        format!(
+                            "primary_key column '{}' cannot be an optional relationship; a primary key cannot be nullable",
+                            fname
+                        ),
+                    ));
+                }
+                _ => {}
             }
         }
     }
@@ -192,7 +317,173 @@ fn analyze_field(field: FieldDef, registry: &EntityRegistry) -> Result<AnalyzedF
         name: field.name,
         ty,
         span: field.span,
+        implement_related: false,
     })
+}
+
+/// Pick which fields on one entity get the `Related` impl.
+fn pick_related_impl_fields(entity: &Ident, fields: &mut [AnalyzedField]) -> Result<()> {
+    validate_related_attr_placement(fields)?;
+
+    let mut error: Option<syn::Error> = None;
+
+    for (target, group) in group_fk_fields_by_target(fields) {
+        match pick_related_impl_field(entity, &target, &group, fields) {
+            Ok(winner) => fields[winner].implement_related = true,
+            Err(e) => match error {
+                Some(ref mut acc) => acc.combine(e),
+                None => error = Some(e),
+            },
+        }
+    }
+
+    match error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Group an entity's relationship fields by the entity they target.
+///
+/// Ordered by target name so an entity with several bad groups reports its
+/// errors the same way on every compile.
+///
+/// Members are returned as indices rather than references so the result borrows
+/// nothing: the caller stays free to read `fields` while validating a group and
+/// to take `&mut` on it afterwards to grant `implement_related` to the winner.
+fn group_fk_fields_by_target(fields: &[AnalyzedField]) -> BTreeMap<String, Vec<usize>> {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+    for (index, field) in fields.iter().enumerate() {
+        let target = match &field.ty {
+            FieldType::BelongsTo { target, .. } | FieldType::HasMany { target } => {
+                target.to_string()
+            }
+            FieldType::Scalar { .. } => continue,
+        };
+
+        groups.entry(target).or_default().push(index);
+    }
+
+    groups
+}
+
+/// Pick which field in one target group gets the `Related` impl, returning
+/// its index.
+///
+/// Two or more `has_many` to this target are indistinguishable -- each
+/// expands to `R::to().rev()`, the target's own back-edge, so they'd produce
+/// identical `RelationDef`s no matter which one wins -- so that stays a
+/// compile error regardless of `#[related]` (provisional; see #766, which
+/// proposes naming the target field so the two can be told apart).
+/// Otherwise, with `belongs_to` (B) and `has_many` (H) totaling at most one
+/// `has_many`:
+///
+/// | B   | H   | `#[related]` marks | Result                        |
+/// |-----|-----|---------------------|--------------------------------|
+/// | 1   | 0/1 | none                | the belongs_to wins (default) |
+/// | any | 0/1 | exactly one         | the marked field wins          |
+/// | ≥2  | 0/1 | none                | error: mark exactly one        |
+/// | any | 0/1 | two or more         | error: only one may be marked  |
+fn pick_related_impl_field(
+    entity: &Ident,
+    target: &str,
+    members: &[usize],
+    fields: &[AnalyzedField],
+) -> Result<usize> {
+    // One field pointing at this target: nothing to disambiguate, whichever
+    // kind it is.
+    if let [only] = members {
+        return Ok(*only);
+    }
+
+    let (belongs_to, has_many): (Vec<usize>, Vec<usize>) = members
+        .iter()
+        .copied()
+        .partition(|&i| matches!(fields[i].ty, FieldType::BelongsTo { .. }));
+
+    if has_many.len() >= 2 {
+        return Err(syn::Error::new(
+            fields[has_many[1]].name.span(),
+            format!(
+                "entity '{}' has {} has_many fields referencing '{}' ({}). This is not supported yet. SeaORM cannot distinguish them without an explicit foreign key.",
+                entity,
+                has_many.len(),
+                target,
+                field_list(&has_many, fields),
+            ),
+        ));
+    }
+
+    let marked: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|&i| fields[i].attrs.related)
+        .collect();
+
+    match marked.as_slice() {
+        [one] => Ok(*one),
+
+        [] => match belongs_to.as_slice() {
+            [only] => Ok(*only),
+
+            _ => Err(syn::Error::new(
+                fields[members[1]].name.span(),
+                format!(
+                    "entity '{}' has {} fields referencing '{}' ({}); mark exactly one with #[related] to choose which owns `Related`",
+                    entity,
+                    members.len(),
+                    target,
+                    field_list(members, fields),
+                ),
+            )),
+        },
+
+        [_, second, ..] => Err(syn::Error::new(
+            fields[*second].name.span(),
+            format!(
+                "entity '{}' marks {} fields referencing '{}' with #[related] ({}); only one may be marked",
+                entity,
+                marked.len(),
+                target,
+                field_list(&marked, fields),
+            ),
+        )),
+    }
+}
+
+fn field_list(indices: &[usize], fields: &[AnalyzedField]) -> String {
+    indices
+        .iter()
+        .map(|&i| format!("'{}'", fields[i].name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// Validate that #[related] is only used on a relationship field (belongs_to
+// or has_many), not a scalar field.
+fn validate_related_attr_placement(fields: &[AnalyzedField]) -> Result<()> {
+    for field in fields.iter() {
+        if !field.attrs.related {
+            continue;
+        }
+
+        match &field.ty {
+            FieldType::BelongsTo { .. } | FieldType::HasMany { .. } => {}
+
+            FieldType::Scalar { .. } => {
+                return Err(syn::Error::new(
+                    field.name.span(),
+                    format!(
+                        "#[related] can only be used on a relationship field (belongs_to or has_many), but was used on the scalar field '{}'",
+                        field.name
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -437,24 +728,128 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_primary_key_must_be_scalar() {
+    fn test_analyze_primary_key_allows_belongs_to_fields() {
         let input = quote! {
-            User {
-                email: String,
+            #[table_name = "transactions"]
+            Tx {
+                name: String,
             }
 
-            #[primary_key(author)]
+            #[table_name = "labels"]
+            Label {
+                #[unique]
+                name: String,
+            }
+
+            #[table_name = "transaction_labels"]
             #[timestamps(none)]
+            #[primary_key(tx_id, label_id)]
+            TxLabel {
+                tx_id: Tx,
+                label_id: Label,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        let tx_label = &analyzed.entities[2];
+        assert_eq!(
+            tx_label.attrs.primary_key,
+            Some(vec!["tx_id".to_string(), "label_id".to_string()])
+        );
+        assert!(matches!(tx_label.fields[0].ty, FieldType::BelongsTo { .. }));
+        assert!(matches!(tx_label.fields[1].ty, FieldType::BelongsTo { .. }));
+    }
+
+    #[test]
+    fn test_analyze_primary_key_rejects_has_many_fields() {
+        let input = quote! {
+            User {
+                posts: Vec<Post>,
+            }
+
             Post {
-                author: User,
                 title: String,
+            }
+
+            #[primary_key(posts)]
+            #[timestamps(none)]
+            UserPosts {
+                posts: Vec<Post>,
             }
         };
 
         let parsed = parse_schema(input).unwrap();
         let result = analyze_schema(parsed);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("scalar type"));
+        assert!(result.unwrap_err().to_string().contains("has_many"));
+    }
+
+    #[test]
+    fn test_analyze_primary_key_rejects_optional_belongs_to() {
+        let input = quote! {
+            User {
+                email: String,
+            }
+
+            #[primary_key(user_id)]
+            #[timestamps(none)]
+            Membership {
+                user_id: Option<User>,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let result = analyze_schema(parsed);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("optional"));
+    }
+
+    #[test]
+    fn test_analyze_primary_key_rejects_self_referential_cycle_at_field() {
+        let input = r#"
+            #[timestamps(none)]
+            #[primary_key(parent)]
+            Category {
+                parent: Category,
+            }
+        "#
+        .parse()
+        .unwrap();
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err();
+
+        assert!(error.to_string().contains("Category.parent"));
+        assert!(error.to_string().contains("primary key cycle"));
+        assert_eq!(error.span().source_text().as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn test_analyze_composite_pk_target_error_points_at_field() {
+        let input = r#"
+            #[primary_key(left_id, right_id)]
+            #[timestamps(none)]
+            Pair {
+                left_id: i32,
+                right_id: i32,
+            }
+
+            PairRef {
+                pair: Pair,
+            }
+        "#
+        .parse()
+        .unwrap();
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err();
+
+        assert!(error.to_string().contains("PairRef.pair"));
+        assert!(error.to_string().contains("left_id"));
+        assert!(error.to_string().contains("right_id"));
+        assert_eq!(error.span().source_text().as_deref(), Some("pair"));
     }
 
     #[test]
@@ -478,5 +873,353 @@ mod tests {
             entity.attrs.primary_key,
             Some(vec!["user_id".to_string(), "role_id".to_string()])
         );
+    }
+
+    /// Every message in a `syn::Error`. `to_string()` renders only the first,
+    /// so combined errors have to be walked to be seen at all.
+    fn error_messages(error: syn::Error) -> Vec<String> {
+        error.into_iter().map(|e| e.to_string()).collect()
+    }
+
+    /// Which fields of `entity` were nominated to own a `Related` impl.
+    fn nominated(entity: &AnalyzedEntity) -> Vec<String> {
+        entity
+            .fields
+            .iter()
+            .filter(|f| f.implement_related)
+            .map(|f| f.name.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_related_single_belongs_to_is_nominated() {
+        let input = quote! {
+            User {
+                email: String,
+            }
+
+            Post {
+                author: User,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        // One field to a target needs no #[related] to disambiguate.
+        assert_eq!(nominated(&analyzed.entities[1]), vec!["author"]);
+    }
+
+    #[test]
+    fn test_related_single_has_many_is_nominated() {
+        let input = quote! {
+            User {
+                posts: Vec<Post>,
+            }
+
+            Post {
+                title: String,
+                author: User,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        assert_eq!(nominated(&analyzed.entities[0]), vec!["posts"]);
+    }
+
+    #[test]
+    fn test_related_belongs_to_beats_has_many_to_same_target() {
+        let input = quote! {
+            Category {
+                name: String,
+                parent: Option<Category>,
+                children: Vec<Category>,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        // The has_many cannot own `Related`: SeaORM derives it as the reverse
+        // of the target's own impl, so `children` resolves through `parent`.
+        assert_eq!(nominated(&analyzed.entities[0]), vec!["parent"]);
+    }
+
+    #[test]
+    fn test_related_belongs_to_beats_has_many_across_entities() {
+        let input = quote! {
+            User {
+                posts: Vec<Post>,
+                featured: Option<Post>,
+            }
+
+            Post {
+                title: String,
+                author: User,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        // Same rule as the self-referential case, with the group spread across
+        // two entities: the belongs_to owns `Related`, the has_many does not.
+        assert_eq!(nominated(&analyzed.entities[0]), vec!["featured"]);
+        assert_eq!(nominated(&analyzed.entities[1]), vec!["author"]);
+    }
+
+    #[test]
+    fn test_related_attr_picks_the_marked_belongs_to() {
+        let input = quote! {
+            Account {
+                name: String,
+            }
+
+            Tx {
+                from: Option<Account>,
+                #[related]
+                to: Option<Account>,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        // Marked on the second field, so a "first field wins" regression fails.
+        assert_eq!(nominated(&analyzed.entities[1]), vec!["to"]);
+    }
+
+    #[test]
+    fn test_related_attr_leaves_other_targets_alone() {
+        let input = quote! {
+            Warehouse {
+                name: String,
+            }
+
+            Currency {
+                code: String,
+            }
+
+            Shipment {
+                origin: Warehouse,
+                destination: Warehouse,
+                #[related]
+                backup: Option<Warehouse>,
+                currency: Currency,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        // `currency` is the only field for its target, so it is nominated
+        // independently of the contested Warehouse group.
+        assert_eq!(nominated(&analyzed.entities[2]), vec!["backup", "currency"]);
+    }
+
+    #[test]
+    fn test_related_rejects_two_belongs_to_with_none_marked() {
+        let input = quote! {
+            Account {
+                name: String,
+            }
+
+            Tx {
+                from: Option<Account>,
+                to: Option<Account>,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err().to_string();
+
+        assert!(error.contains("mark exactly one with #[related]"));
+        assert!(error.contains("'from', 'to'"));
+    }
+
+    #[test]
+    fn test_related_rejects_two_belongs_to_both_marked() {
+        let input = quote! {
+            Account {
+                name: String,
+            }
+
+            Tx {
+                #[related]
+                from: Option<Account>,
+                #[related]
+                to: Option<Account>,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err().to_string();
+
+        assert!(error.contains("only one may be marked"));
+        assert!(error.contains("'from', 'to'"));
+    }
+
+    #[test]
+    fn test_related_rejects_two_has_many_to_same_target() {
+        let input = quote! {
+            User {
+                posts: Vec<Post>,
+                drafts: Vec<Post>,
+            }
+
+            Post {
+                title: String,
+                author: User,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err().to_string();
+
+        // Both mirror Post's single `Related<User>`, so they would produce
+        // identical joins and `drafts` would silently mean every post.
+        assert!(error.contains("has_many fields referencing"));
+        assert!(error.contains("'posts', 'drafts'"));
+    }
+
+    #[test]
+    fn test_related_rejects_two_has_many_even_when_a_belongs_to_could_win() {
+        let input = quote! {
+            User {
+                posts: Vec<Post>,
+                drafts: Vec<Post>,
+                favourite: Option<Post>,
+            }
+
+            Post {
+                title: String,
+                author: User,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err().to_string();
+
+        // `favourite` is eligible and would work, but the has_many pair is
+        // broken with or without it: both mirror Post's back-edge, so they
+        // resolve identically no matter who owns `Related`.
+        assert!(error.contains("has_many fields referencing"));
+    }
+
+    #[test]
+    fn test_related_attr_on_has_many_overrides_belongs_to_default() {
+        let input = quote! {
+            User {
+                #[related]
+                posts: Vec<Post>,
+                featured: Option<Post>,
+            }
+
+            Post {
+                title: String,
+                author: User,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+
+        // Marking the has_many flips the default: it owns `Related` and the
+        // belongs_to falls back to `Linked` instead.
+        assert_eq!(nominated(&analyzed.entities[0]), vec!["posts"]);
+    }
+
+    #[test]
+    fn test_related_rejects_has_many_and_belongs_to_both_marked() {
+        let input = quote! {
+            User {
+                #[related]
+                posts: Vec<Post>,
+                #[related]
+                featured: Option<Post>,
+            }
+
+            Post {
+                title: String,
+                author: User,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err().to_string();
+
+        assert!(error.contains("only one may be marked"));
+        assert!(error.contains("'posts', 'featured'"));
+    }
+
+    #[test]
+    fn test_related_attr_rejected_on_scalar_field() {
+        let input = quote! {
+            User {
+                #[related]
+                email: String,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let error = analyze_schema(parsed).unwrap_err().to_string();
+
+        assert!(error.contains("relationship field (belongs_to or has_many)"));
+        assert!(error.contains("scalar field 'email'"));
+    }
+
+    #[test]
+    fn test_related_reports_every_contested_group() {
+        let input = quote! {
+            Account {
+                name: String,
+            }
+
+            Warehouse {
+                name: String,
+            }
+
+            Tx {
+                from: Option<Account>,
+                to: Option<Account>,
+                origin: Option<Warehouse>,
+                destination: Option<Warehouse>,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let messages = error_messages(analyze_schema(parsed).unwrap_err());
+
+        // Groups are walked in target-name order, so both groups are reported
+        // and always in the same order.
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].contains("'Account'"));
+        assert!(messages[1].contains("'Warehouse'"));
+    }
+
+    #[test]
+    fn test_related_misplaced_attr_reported_before_group_rules() {
+        let input = quote! {
+            Account {
+                name: String,
+            }
+
+            Tx {
+                #[related]
+                amount: i64,
+                from: Option<Account>,
+                to: Option<Account>,
+            }
+        };
+
+        let parsed = parse_schema(input).unwrap();
+        let messages = error_messages(analyze_schema(parsed).unwrap_err());
+
+        // A misplaced #[related] makes the group rules meaningless, so it is
+        // reported alone rather than alongside the unmarked Account group.
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("scalar field 'amount'"));
     }
 }

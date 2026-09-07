@@ -13,7 +13,7 @@ Add the database feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rapina = { version = "0.13.0", features = ["postgres"] }
+rapina = { version = "0.13.1", features = ["postgres"] }
 # or "mysql", "sqlite"
 ```
 
@@ -227,6 +227,8 @@ UserRole {
 }
 ```
 
+A relationship field named in `#[primary_key(...)]` keeps its column name **verbatim**. Elsewhere a `belongs_to` field gets an `_id` suffix (`author: User` becomes `author_id`), but a primary key column is referenced by the name you declared, so `user_id: User` stays `user_id` rather than becoming `user_id_id`. Name these fields the way you want the columns to read. The field still resolves to the target's primary key type, and the target must have a single primary key column.
+
 #### Field Attributes
 
 | Attribute | Description |
@@ -234,6 +236,7 @@ UserRole {
 | `#[unique]` | Mark field as unique |
 | `#[index]` | Create an index on this column |
 | `#[column = "name"]` | Custom column name in database |
+| `#[related]` | Make this the default connector to the target table, used by `find_related` / `find_also_related` |
 
 ```rust
 User {
@@ -247,6 +250,44 @@ User {
     name: String,
 }
 ```
+
+### Handling Complex Relations
+
+A table can have several foreign key columns pointing at the same table. When it does, mark one of them with `#[related]` to make it the default connector to that table:
+
+```rust
+Account {
+    name: String,
+}
+
+Transaction {
+    from: Option<Account>,
+    #[related]
+    to: Option<Account>,
+    amount: i64,
+}
+```
+
+`find_related` and `find_also_related` ask for an entity, not a field, so they follow the marked one. The other fields are reached through a generated link named after the field — `from` becomes `FromLink`:
+
+```rust
+// follows `to`, the default connector
+let txs = Transaction::find()
+    .find_also_related(Account)
+    .all(db.conn())
+    .await?;
+
+// follows `from`
+let sender = tx.find_linked(transaction::FromLink).one(db.conn()).await?;
+```
+
+Rules:
+
+- When more than one `belongs_to` on an entity points at the same table, exactly one of them must be marked `#[related]`. Marking none, or marking more than one, is a compile error naming the entity, the target, and the fields involved.
+- A single `belongs_to` to a table needs no attribute — it is already the default connector.
+- If a `belongs_to` and a `has_many` on the same entity both target the same table, the `belongs_to` is the default connector. Mark the `has_many` with `#[related]` instead if you want it to be the connector — the `belongs_to` then falls back to a generated link like the others.
+- Two `has_many` fields to the same table aren't supported yet ([#766](https://github.com/rapina-rs/rapina/issues/766)) — SeaORM can't tell them apart without an explicit foreign key, so this is a compile error regardless of `#[related]`.
+- `#[related]` can only be used on a `belongs_to` or `has_many` field. Using it on a scalar field is a compile error.
 
 ## Database Schema
 

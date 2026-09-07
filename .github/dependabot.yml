@@ -3,10 +3,16 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 10
     commit-message:
       prefix: "Update"
+    groups:
+      tungstenite:
+        patterns:
+          - "tokio-tungstenite"
+          - "hyper-tungstenite"
+          - "tungstenite"
     ignore:
       - dependency-name: "sea-schema"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
@@ -19,7 +25,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "Update"
